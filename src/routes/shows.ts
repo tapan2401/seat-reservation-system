@@ -6,6 +6,11 @@ import { checkIdempotency } from '../middlewares/idempotency.js';
 import { createShowSchema, reserveSeatSchema } from '../schemas.js';
 import { logger } from '../utils/logger.js';
 import { ReservationStatus, SeatStatus } from '../constants/enums.js';
+import {
+  reservationsConfirmedTotal,
+  reservationsDeclinedTotal,
+  updateSeatsAvailableGauge
+} from '../utils/metrics.js';
 
 export const showsRouter = Router();
 
@@ -44,7 +49,7 @@ showsRouter.post('/:id/reserve', requireAuth, checkIdempotency, async (req: AppR
   const client = await pool.connect();
   try {
     const validated = reserveSeatSchema.parse(req.body);
-    const showId = req.params.id;
+    const showId = req.params.id as string;
     const userId = req.user!.id;
     const reqId = req.id;
     const requestHash = (req as any).requestHash;
@@ -92,6 +97,7 @@ showsRouter.post('/:id/reserve', requireAuth, checkIdempotency, async (req: AppR
 
     if (totalHeld + requestedSeatCount > limit) {
       logger.info({ reqId, userId, showId }, 'User limit exceeded');
+      reservationsDeclinedTotal.inc({ reason: 'USER_LIMIT_EXCEEDED' });
       await client.query('ROLLBACK');
       res.status(409).json({ error: 'Conflict', reason: 'USER_LIMIT_EXCEEDED' });
       return;
@@ -129,6 +135,7 @@ showsRouter.post('/:id/reserve', requireAuth, checkIdempotency, async (req: AppR
 
     if (unavailableSeats.length > 0) {
       logger.info({ reqId, unavailableSeats }, 'Seats already taken');
+      reservationsDeclinedTotal.inc({ reason: 'SEAT_ALREADY_TAKEN' });
       await client.query('ROLLBACK');
       res.status(409).json({
         error: 'Conflict',
@@ -171,6 +178,9 @@ showsRouter.post('/:id/reserve', requireAuth, checkIdempotency, async (req: AppR
 
     await client.query('COMMIT');
 
+    reservationsConfirmedTotal.inc();
+    updateSeatsAvailableGauge(showId).catch(console.error);
+
     res.status(201).json(responsePayload);
 
   } catch (error) {
@@ -178,5 +188,50 @@ showsRouter.post('/:id/reserve', requireAuth, checkIdempotency, async (req: AppR
     next(error);
   } finally {
     client.release();
+  }
+});
+
+// GET /shows/:id
+showsRouter.get('/:id', async (req: AppRequest, res: Response, next: NextFunction) => {
+  try {
+    const showId = req.params.id;
+    const showResult = await pool.query(`SELECT id, name, price_paise FROM shows WHERE id = $1`, [showId]);
+
+    if (showResult.rowCount === 0) {
+      res.status(404).json({ error: 'Show not found' });
+      return;
+    }
+
+    const statsResult = await pool.query(
+      `SELECT status, count(*) as count 
+       FROM show_seats 
+       WHERE show_id = $1 
+       GROUP BY status`,
+      [showId]
+    );
+
+    let availableCount = 0;
+    let confirmedCount = 0;
+
+    statsResult.rows.forEach(row => {
+      const count = parseInt(row.count, 10);
+      if (row.status === SeatStatus.AVAILABLE) availableCount = count;
+      if (row.status === SeatStatus.CONFIRMED) confirmedCount = count;
+    });
+
+    const totalSeats = availableCount + confirmedCount;
+
+    res.status(200).json({
+      show: showResult.rows[0],
+      reconciliation: {
+        available: availableCount,
+        confirmed: confirmedCount,
+        total_seats: totalSeats,
+        is_valid: (availableCount + confirmedCount) === totalSeats
+      }
+    });
+
+  } catch (error) {
+    next(error);
   }
 });
